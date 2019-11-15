@@ -1,0 +1,147 @@
+- name: basic host prep
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - name: /etc/hosts cleanup
+      replace: path="/etc/hosts" regexp='^[^#](.*{{ inventory_hostname | regex_escape() }}.*)$' replace='#\1'
+    - name: set timezone
+      timezone: name=America/Los_Angeles
+    - name: disable kdump
+      service: name=kdump enabled=no state=stopped
+
+- name: yum fixups
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - lineinfile: path=/etc/yum/pluginconf.d/fastestmirror.conf regexp='^enabled=.*$' line='enabled=0'
+      notify:  "clear yum cache"
+    - replace: path=/etc/yum.repos.d/CentOS-Base.repo regexp='^mirrorlist=(.*)$' replace='#mirrorlist=\1'
+      notify:  "clear yum cache"
+    - replace: path=/etc/yum.repos.d/CentOS-Base.repo regexp='#baseurl=(.*)$' replace='baseurl=\1'
+      notify:  "clear yum cache"
+    - replace: path=/etc/yum.repos.d/CentOS-Base.repo regexp='^baseurl\s*=(?!http://mirrors.ocf.berkeley.edu/centos/\$releasever/os/\$basearch/$).*$' replace='baseurl=http://mirrors.ocf.berkeley.edu/centos/$releasever/os/$basearch/'
+      notify:  "clear yum cache"
+    - yum: name=deltarpm
+  handlers:
+   - name: clear yum cache
+     command: yum clean all
+     args:
+       warn: no
+
+- name: firewall setup
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - name: Install firewalld
+      yum: name=firewalld state=latest
+    - name: start firewalld
+      service: name=firewalld state=started enabled=yes
+    - name: add public interface to public zone
+      firewalld: zone=public interface={{ pub_interface }} permanent=yes immediate=yes state=enabled
+    - name: add public interface to public zone (config files; see https://github.com/ansible/ansible/issues/41738)
+      lineinfile: path=/etc/sysconfig/network-scripts/ifcfg-{{ pub_interface }} regexp='^ZONE=.*$' line='ZONE=public'
+    - name: add private interface to trusted zone (firewalld)
+      firewalld: zone=trusted interface={{ priv_interface }} permanent=yes immediate=yes state=enabled
+    - name: add private interface to trusted zone (config files; see https://github.com/ansible/ansible/issues/41738)
+      lineinfile: path=/etc/sysconfig/network-scripts/ifcfg-{{ priv_interface }} regexp='^ZONE=.*$' line='ZONE=trusted'
+
+- name: EPEL repository setup
+  hosts: all
+  become: true
+  tasks:
+    - name: Add EPEL repository
+      yum_repository:
+        name: epel
+        description: EPEL YUM repo
+        baseurl: https://download.fedoraproject.org/pub/epel/$releasever/$basearch/
+    - name: Import EPEL RPM key
+      rpm_key:
+        key: https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{{ ansible_distribution_major_version }}
+        fingerprint: 91E9 7D7C 4A5E 96F1 7F3E 888F 6A2F AEA2 352C 64E5
+        
+- name: install useful utilities
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - yum: name="joe,lsof,iftop,screen,bind-utils,telnet,git,jq,pv"
+
+- name: setup patch Tuesday cronjob
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - name: cron job
+      copy:
+        dest: /etc/cron.d/yum-cron-tuesday
+        content: |
+          SHELL=/bin/bash
+          PATH=/sbin:/bin:/usr/sbin:/usr/bin
+          MAILTO=root
+          0 8 * * tue root  yum -y update >/dev/null
+
+# ansible-galaxy install andrewrothstein.miniconda
+- name: install Miniconda
+  hosts: all
+  vars:
+    miniconda_pkg_update: False
+  roles:
+    - andrewrothstein.miniconda
+
+# requires conda.py from https://github.com/UDST/ansible-conda/blob/master/conda.py
+# in ~/.ansible/plugins/modules/conda.py (or equivalent)
+- name: Install kafka utilities
+  hosts: all
+  become: true
+  gather_facts: False
+  tasks:
+    - name: kt
+      get_url: url="http://research.majuric.org/other/kt" dest="/usr/local/bin/kt" mode="+x"
+    - name: kafkacat
+      get_url: url="http://research.majuric.org/other/kafkacat" dest="/usr/local/bin/kafkacat" mode="+x"
+    - name: kcp
+      get_url: url="https://raw.githubusercontent.com/mjuric/kcp/master/kcp" dest="/usr/local/bin/kcp" mode="+x"
+    - name: install Python kafka dependencies
+      conda:
+        name: "{{ item }}"
+        channels: defaults conda-forge
+        executable: /usr/local/anaconda/bin/conda
+      loop:
+        - python-confluent-kafka
+        - fastavro
+
+# Install kafka tools
+- name: Confluent Playbook
+  import_playbook: cp-ansible/all.yml
+
+# Install alerts and ingestion script on broker #1
+- name: Demo ZTF alerts and injector
+  tags: alerts
+  hosts: all[0]
+  become: true
+  gather_facts: False
+  tasks:
+    - name: download alert tarball
+      get_url: url="https://ztf.uw.edu/alerts/public/ztf_public_20180912.tar.gz" dest="/root/ztf_public_20180912.tar.gz"
+    - name: unpack alerts
+      shell: |
+        set -e
+
+        rm -rf alerts
+        mkdir -p alerts
+        cd alerts
+
+        tar xzf ../ztf_public_20180912.tar.gz
+        
+        touch .unpacked
+      args:
+        chdir: /root
+        creates: /root/alerts/.unpacked
+    - name: install inject.sh
+      copy:
+        src: demo-scripts/inject.sh
+        dest: /root/inject.sh
+        mode: +x
