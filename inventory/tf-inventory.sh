@@ -7,7 +7,7 @@
 # * all Kafka services should be installed on all droplets
 #
 
-HOSTS=$(cat /Users/mjuric/projects/kafka-demo/broker-ng/terraform.tfstate | jq '[ .modules[].resources[] | select( .type | contains("digitalocean_droplet") ) | .primary.attributes.name ]' -c)
+HOSTS=$(cat terraform.tfstate | jq '[ .modules[].resources[] | select( .type | contains("digitalocean_droplet") ) | .primary.attributes.name ]' -c)
 
 cat <<-EOF
 zookeeper:
